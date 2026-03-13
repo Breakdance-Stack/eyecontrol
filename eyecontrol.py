@@ -2,10 +2,10 @@
 EyeControl - Control your Windows PC with your eyes.
 Uses webcam-based iris tracking to replace the mouse cursor.
 
-Tracking uses iris position in the full camera frame (captures both
-head movement and eye movement) for reliable full-screen coverage.
-Drift compensation via baseline tracking on raw iris coordinates
-(before calibration amplification) eliminates cursor wandering.
+Key techniques:
+- Drift compensation via baseline tracking on raw iris coordinates
+- Non-linear sensitivity curve (precise in center, full range at edges)
+- Post-saccade settling (averages frames for stable fixation)
 """
 
 import csv
@@ -53,7 +53,6 @@ def get_screen_size():
 
 
 def get_iris_position(landmarks):
-    """Average iris center in normalized frame coordinates (0-1)."""
     left = landmarks[LEFT_IRIS_CENTER]
     right = landmarks[RIGHT_IRIS_CENTER]
     return (left.x + right.x) / 2.0, (left.y + right.y) / 2.0
@@ -70,10 +69,7 @@ def eye_aspect_ratio(landmarks, indices, w, h):
 
 
 class MedianFilter:
-    """Sliding-window median filter to remove tracking outliers."""
-
     def __init__(self, window=7):
-        self.window = window
         self.buf_x = deque(maxlen=window)
         self.buf_y = deque(maxlen=window)
 
@@ -89,25 +85,29 @@ class MedianFilter:
 
 class DriftCancelSmoother:
     """
-    Drift-compensating smoother with raw-signal saccade detection.
-
-    Key insight from log analysis: the calibration mapping amplifies
-    raw iris noise ~180,000x. So drift detection must happen on the
-    RAW iris coordinates (before amplification), where noise is only
-    ±0.001 and real saccades are >0.003.
-
-    Flow:
-    1. Median-filter raw iris coords (removes spikes)
-    2. Track a slow baseline on raw coords (absorbs drift)
-    3. Only when raw deviation > threshold → saccade → update cursor
-    4. Cursor smoothly transitions to new mapped position
+    Drift-compensating smoother with:
+    - Raw-signal saccade detection (before calibration amplification)
+    - Non-linear sensitivity curve (precise center, full range at edges)
+    - Post-saccade settling (averages N frames for stable fixation point)
     """
 
-    def __init__(self, raw_saccade_threshold=0.003, baseline_alpha=0.01,
-                 cursor_alpha=0.2):
+    def __init__(self, screen_w, screen_h,
+                 raw_saccade_threshold=0.004,
+                 baseline_alpha=0.01,
+                 cursor_alpha=0.12,
+                 settle_frames=10,
+                 curve_exponent=1.8):
+        self.screen_w = screen_w
+        self.screen_h = screen_h
+        self.center_x = screen_w / 2.0
+        self.center_y = screen_h / 2.0
+        self.max_dist = (self.center_x ** 2 + self.center_y ** 2) ** 0.5
+
         self.raw_saccade_threshold = raw_saccade_threshold
         self.baseline_alpha = baseline_alpha
         self.cursor_alpha = cursor_alpha
+        self.settle_frames = settle_frames
+        self.curve_exponent = curve_exponent
 
         self.raw_baseline_x = None
         self.raw_baseline_y = None
@@ -116,38 +116,78 @@ class DriftCancelSmoother:
         self.cursor_x = None
         self.cursor_y = None
 
+        # Settling state
+        self.settling = False
+        self.settle_buf = []
+        self.settle_remaining = 0
+
         self.raw_median = MedianFilter(window=7)
-        self.mapped_median = MedianFilter(window=5)
+        self.mapped_median = MedianFilter(window=7)
+
+    def _apply_curve(self, sx, sy):
+        """
+        Non-lineare Empfindlichkeitskurve:
+        - Kleine Bewegungen (nah an Bildschirmmitte) → stark gedämpft (präzise)
+        - Große Bewegungen (Richtung Rand) → weniger gedämpft (volle Reichweite)
+        """
+        dx = sx - self.center_x
+        dy = sy - self.center_y
+        dist = (dx * dx + dy * dy) ** 0.5
+
+        if dist < 1.0:
+            return self.center_x, self.center_y
+
+        normalized = min(dist / self.max_dist, 1.0)
+        scaled = normalized ** self.curve_exponent
+        factor = (scaled * self.max_dist) / dist
+
+        out_x = self.center_x + dx * factor
+        out_y = self.center_y + dy * factor
+        out_x = np.clip(out_x, 5, self.screen_w - 5)
+        out_y = np.clip(out_y, 5, self.screen_h - 5)
+        return float(out_x), float(out_y)
 
     def update(self, raw_ix, raw_iy, mapped_sx, mapped_sy):
-        # Median-Filter auf rohe Iris-Koordinaten (für Saccade-Erkennung)
         filt_rx, filt_ry = self.raw_median.update(raw_ix, raw_iy)
-        # Median-Filter auf gemappte Koordinaten (für Positionierung)
         filt_sx, filt_sy = self.mapped_median.update(mapped_sx, mapped_sy)
+
+        # Nicht-lineare Kurve anwenden
+        curved_x, curved_y = self._apply_curve(filt_sx, filt_sy)
 
         if self.cursor_x is None:
             self.raw_baseline_x = filt_rx
             self.raw_baseline_y = filt_ry
-            self.target_x = self.cursor_x = filt_sx
-            self.target_y = self.cursor_y = filt_sy
-            return filt_sx, filt_sy
+            self.target_x = self.cursor_x = curved_x
+            self.target_y = self.cursor_y = curved_y
+            return curved_x, curved_y
 
-        # Baseline folgt den rohen Iris-Koordinaten langsam (absorbiert Drift)
+        # Baseline auf Roh-Signal (absorbiert langsamen Drift)
         self.raw_baseline_x += self.baseline_alpha * (filt_rx - self.raw_baseline_x)
         self.raw_baseline_y += self.baseline_alpha * (filt_ry - self.raw_baseline_y)
 
-        # Saccade-Erkennung auf ROHEM Signal (vor Kalibrierungs-Verstärkung)
+        # Saccade-Erkennung auf Roh-Signal
         dev_x = filt_rx - self.raw_baseline_x
         dev_y = filt_ry - self.raw_baseline_y
         dev = (dev_x ** 2 + dev_y ** 2) ** 0.5
 
         if dev > self.raw_saccade_threshold:
-            # Echte Blickbewegung erkannt → Zielposition aktualisieren
-            self.target_x = filt_sx
-            self.target_y = filt_sy
-            # Baseline auf neue Rohposition resetten
+            # Sakkade erkannt → Settling-Phase starten
+            self.settling = True
+            self.settle_buf = [(curved_x, curved_y)]
+            self.settle_remaining = self.settle_frames
             self.raw_baseline_x = filt_rx
             self.raw_baseline_y = filt_ry
+
+        if self.settling:
+            self.settle_buf.append((curved_x, curved_y))
+            self.settle_remaining -= 1
+            if self.settle_remaining <= 0:
+                # Settling abgeschlossen: Ziel = Median der gesammelten Frames
+                xs = [p[0] for p in self.settle_buf]
+                ys = [p[1] for p in self.settle_buf]
+                self.target_x = float(np.median(xs))
+                self.target_y = float(np.median(ys))
+                self.settling = False
 
         # Cursor gleitet sanft zum Ziel
         self.cursor_x += self.cursor_alpha * (self.target_x - self.cursor_x)
@@ -161,6 +201,9 @@ class DriftCancelSmoother:
         self.target_y = None
         self.cursor_x = None
         self.cursor_y = None
+        self.settling = False
+        self.settle_buf = []
+        self.settle_remaining = 0
         self.raw_median.reset()
         self.mapped_median.reset()
 
@@ -170,11 +213,6 @@ class DriftCancelSmoother:
 # ---------------------------------------------------------------------------
 
 class DriftLogger:
-    """
-    Zeichnet Rohdaten und Cursor-Positionen in eine CSV-Datei auf.
-    Taste 'l' startet/stoppt die Aufnahme (10 Sekunden automatisch).
-    """
-
     def __init__(self, path=LOG_FILE):
         self.path = path
         self.active = False
@@ -207,11 +245,9 @@ class DriftLogger:
         if elapsed > self.duration:
             self.stop()
             return
-
         if self.first_smooth_x is None:
             self.first_smooth_x = smooth_x
             self.first_smooth_y = smooth_y
-
         self.writer.writerow([
             f"{elapsed:.3f}",
             f"{raw_ix:.6f}", f"{raw_iy:.6f}",
@@ -239,8 +275,6 @@ class DriftLogger:
 # ---------------------------------------------------------------------------
 
 class Calibrator:
-    """5-point calibration: maps iris frame-coordinates to screen coordinates."""
-
     def __init__(self, screen_w, screen_h):
         self.screen_w = screen_w
         self.screen_h = screen_h
@@ -314,7 +348,6 @@ class Calibrator:
     def _fit_transform(self):
         iris = np.array(self.iris_samples)
         screen = np.array(self.screen_points)
-
         if len(iris) >= 5:
             A = np.column_stack([
                 np.ones(len(iris)),
@@ -327,7 +360,6 @@ class Calibrator:
                 np.ones(len(iris)),
                 iris[:, 0], iris[:, 1],
             ])
-
         self.transform_x, _, _, _ = np.linalg.lstsq(A, screen[:, 0], rcond=None)
         self.transform_y, _, _, _ = np.linalg.lstsq(A, screen[:, 1], rcond=None)
 
@@ -337,12 +369,10 @@ class Calibrator:
             sx = np.clip((1.0 - ix) * self.screen_w, margin, self.screen_w - margin)
             sy = np.clip(iy * self.screen_h, margin, self.screen_h - margin)
             return sx, sy
-
         if len(self.transform_x) == 5:
             features = np.array([1, ix, iy, ix * iy, ix ** 2])
         else:
             features = np.array([1, ix, iy])
-
         sx = float(features @ self.transform_x)
         sy = float(features @ self.transform_y)
         sx = np.clip(sx, margin, self.screen_w - margin)
@@ -426,7 +456,7 @@ def main():
     else:
         print("Bestehende Kalibrierung geladen. (Taste 'c' zum Neu-Kalibrieren)")
 
-    smoother = DriftCancelSmoother()
+    smoother = DriftCancelSmoother(screen_w, screen_h)
     logger = DriftLogger()
 
     EAR_THRESHOLD = 0.21
