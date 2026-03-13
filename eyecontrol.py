@@ -6,8 +6,11 @@ Tracking uses iris position in the full camera frame (captures both
 head movement and eye movement) for reliable full-screen coverage.
 """
 
+import csv
 import json
 import sys
+import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -26,11 +29,11 @@ except ImportError:
 LEFT_IRIS_CENTER = 473
 RIGHT_IRIS_CENTER = 468
 
-# EAR landmarks – 6 points per eye
 LEFT_EAR_INDICES = [362, 385, 387, 263, 373, 380]
 RIGHT_EAR_INDICES = [33, 160, 158, 133, 153, 144]
 
 CALIBRATION_FILE = Path("calibration_data.json")
+LOG_FILE = Path("drift_log.csv")
 
 
 # ---------------------------------------------------------------------------
@@ -48,15 +51,10 @@ def get_screen_size():
 
 
 def get_iris_position(landmarks):
-    """
-    Get the average iris center position in normalized frame coordinates (0-1).
-    This captures both head movement and eye movement for maximum range.
-    """
+    """Average iris center in normalized frame coordinates (0-1)."""
     left = landmarks[LEFT_IRIS_CENTER]
     right = landmarks[RIGHT_IRIS_CENTER]
-    x = (left.x + right.x) / 2.0
-    y = (left.y + right.y) / 2.0
-    return x, y
+    return (left.x + right.x) / 2.0, (left.y + right.y) / 2.0
 
 
 def eye_aspect_ratio(landmarks, indices, w, h):
@@ -69,29 +67,53 @@ def eye_aspect_ratio(landmarks, indices, w, h):
     return (v1 + v2) / (2.0 * h_dist)
 
 
+class MedianFilter:
+    """Sliding-window median filter to remove iris tracking outliers."""
+
+    def __init__(self, window=5):
+        self.window = window
+        self.buf_x = deque(maxlen=window)
+        self.buf_y = deque(maxlen=window)
+
+    def update(self, x, y):
+        self.buf_x.append(x)
+        self.buf_y.append(y)
+        return float(np.median(self.buf_x)), float(np.median(self.buf_y))
+
+    def reset(self):
+        self.buf_x.clear()
+        self.buf_y.clear()
+
+
 class Smoother:
     """
-    Adaptive smoother with deadzone to eliminate stick-drift.
-    Small movements below the deadzone threshold are completely ignored.
+    Adaptive smoother with deadzone to eliminate drift.
+    - Median pre-filter removes outlier spikes
+    - Deadzone ignores micro-movements
+    - Adaptive alpha: slow when still, fast when moving
     """
 
-    def __init__(self, alpha_slow=0.04, alpha_fast=0.35,
-                 speed_threshold=50.0, deadzone=8.0):
+    def __init__(self, alpha_slow=0.03, alpha_fast=0.3,
+                 speed_threshold=40.0, deadzone=15.0):
         self.alpha_slow = alpha_slow
         self.alpha_fast = alpha_fast
         self.speed_threshold = speed_threshold
         self.deadzone = deadzone
         self.x = None
         self.y = None
+        self.median = MedianFilter(window=5)
 
     def update(self, x, y):
+        # Median-Filter zuerst: entfernt Ausreißer
+        x, y = self.median.update(x, y)
+
         if self.x is None:
             self.x, self.y = x, y
             return self.x, self.y
 
         speed = ((x - self.x) ** 2 + (y - self.y) ** 2) ** 0.5
 
-        # Deadzone: ignoriere Mikro-Bewegungen (Rauschen / Drift)
+        # Deadzone: ignoriere kleine Bewegungen komplett
         if speed < self.deadzone:
             return self.x, self.y
 
@@ -105,6 +127,76 @@ class Smoother:
     def reset(self):
         self.x = None
         self.y = None
+        self.median.reset()
+
+
+# ---------------------------------------------------------------------------
+# Drift Logger
+# ---------------------------------------------------------------------------
+
+class DriftLogger:
+    """
+    Zeichnet Rohdaten und Cursor-Positionen in eine CSV-Datei auf.
+    Taste 'l' startet/stoppt die Aufnahme (10 Sekunden automatisch).
+    """
+
+    def __init__(self, path=LOG_FILE):
+        self.path = path
+        self.active = False
+        self.start_time = 0
+        self.duration = 10.0  # Sekunden
+        self.writer = None
+        self.file = None
+
+    def start(self):
+        self.file = open(self.path, "w", newline="")
+        self.writer = csv.writer(self.file)
+        self.writer.writerow([
+            "time_s",
+            "raw_iris_x", "raw_iris_y",
+            "mapped_screen_x", "mapped_screen_y",
+            "smoothed_x", "smoothed_y",
+            "delta_from_start_x", "delta_from_start_y",
+        ])
+        self.active = True
+        self.start_time = time.time()
+        self.first_smooth_x = None
+        self.first_smooth_y = None
+        print(f"--- LOG GESTARTET ({self.duration}s) → {self.path} ---")
+        print("Schau auf einen festen Punkt und bewege dich nicht!")
+
+    def log(self, raw_ix, raw_iy, mapped_sx, mapped_sy, smooth_x, smooth_y):
+        if not self.active:
+            return
+        elapsed = time.time() - self.start_time
+        if elapsed > self.duration:
+            self.stop()
+            return
+
+        if self.first_smooth_x is None:
+            self.first_smooth_x = smooth_x
+            self.first_smooth_y = smooth_y
+
+        self.writer.writerow([
+            f"{elapsed:.3f}",
+            f"{raw_ix:.6f}", f"{raw_iy:.6f}",
+            f"{mapped_sx:.1f}", f"{mapped_sy:.1f}",
+            f"{smooth_x:.1f}", f"{smooth_y:.1f}",
+            f"{smooth_x - self.first_smooth_x:.1f}",
+            f"{smooth_y - self.first_smooth_y:.1f}",
+        ])
+
+    def stop(self):
+        if self.file:
+            self.file.close()
+            self.file = None
+        self.active = False
+        self.writer = None
+        print(f"--- LOG GESTOPPT → {self.path} ---")
+        print("Schick mir die Datei drift_log.csv!")
+
+    def is_active(self):
+        return self.active
 
 
 # ---------------------------------------------------------------------------
@@ -112,11 +204,7 @@ class Smoother:
 # ---------------------------------------------------------------------------
 
 class Calibrator:
-    """
-    5-point calibration: maps iris frame-coordinates to screen coordinates.
-    Uses the iris position in the full camera frame (not relative to eye corners)
-    for much better range and stability.
-    """
+    """5-point calibration: maps iris frame-coordinates to screen coordinates."""
 
     def __init__(self, screen_w, screen_h):
         self.screen_w = screen_w
@@ -127,19 +215,17 @@ class Calibrator:
         self.transform_y = None
 
     def _target_points(self):
-        """5 calibration points: center + 4 corners with margin."""
         mx = int(self.screen_w * 0.12)
         my = int(self.screen_h * 0.12)
         return [
-            (self.screen_w // 2, self.screen_h // 2),  # center first
-            (mx, my),                                    # top-left
-            (self.screen_w - mx, my),                    # top-right
-            (mx, self.screen_h - my),                    # bottom-left
-            (self.screen_w - mx, self.screen_h - my),    # bottom-right
+            (self.screen_w // 2, self.screen_h // 2),
+            (mx, my),
+            (self.screen_w - mx, my),
+            (mx, self.screen_h - my),
+            (self.screen_w - mx, self.screen_h - my),
         ]
 
     def run(self, face_mesh, cap):
-        """Interactive calibration: show dots, user looks at each, press SPACE."""
         cv2.namedWindow("Calibration", cv2.WND_PROP_FULLSCREEN)
         cv2.setWindowProperty("Calibration", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
@@ -148,11 +234,9 @@ class Calibrator:
         self.screen_points = []
 
         for idx, (sx, sy) in enumerate(points):
-            # Draw target
             canvas = np.zeros((self.screen_h, self.screen_w, 3), dtype=np.uint8)
             cv2.circle(canvas, (sx, sy), 30, (0, 255, 0), -1)
             cv2.circle(canvas, (sx, sy), 6, (255, 255, 255), -1)
-
             step_text = f"Schau auf den Punkt ({idx + 1}/{len(points)}) - dann LEERTASTE"
             cv2.putText(canvas, step_text, (30, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
@@ -179,11 +263,11 @@ class Calibrator:
                     ix, iy = get_iris_position(lm)
                     collected.append((ix, iy))
 
-                if key == 32 and len(collected) >= 10:  # SPACE
-                    recent = collected[-20:]
-                    mean_x = np.mean([s[0] for s in recent])
-                    mean_y = np.mean([s[1] for s in recent])
-                    self.iris_samples.append((mean_x, mean_y))
+                if key == 32 and len(collected) >= 10:
+                    recent = collected[-30:]
+                    mean_x = np.median([s[0] for s in recent])
+                    mean_y = np.median([s[1] for s in recent])
+                    self.iris_samples.append((float(mean_x), float(mean_y)))
                     self.screen_points.append((sx, sy))
                     break
 
@@ -193,12 +277,9 @@ class Calibrator:
         return True
 
     def _fit_transform(self):
-        """Fit affine transform from iris coords to screen coords."""
         iris = np.array(self.iris_samples)
         screen = np.array(self.screen_points)
 
-        # Feature matrix: [1, x, y, x*y, x^2, y^2] if enough points,
-        # else simpler [1, x, y]
         if len(iris) >= 5:
             A = np.column_stack([
                 np.ones(len(iris)),
@@ -216,9 +297,8 @@ class Calibrator:
         self.transform_y, _, _, _ = np.linalg.lstsq(A, screen[:, 1], rcond=None)
 
     def map(self, ix, iy):
-        """Map iris frame position to screen coordinates."""
+        margin = 5
         if self.transform_x is None:
-            margin = 5
             sx = np.clip((1.0 - ix) * self.screen_w, margin, self.screen_w - margin)
             sy = np.clip(iy * self.screen_h, margin, self.screen_h - margin)
             return sx, sy
@@ -230,8 +310,6 @@ class Calibrator:
 
         sx = float(features @ self.transform_x)
         sy = float(features @ self.transform_y)
-        # Sicherheitsrand: nie in die Ecken (verhindert PyAutoGUI Failsafe)
-        margin = 5
         sx = np.clip(sx, margin, self.screen_w - margin)
         sy = np.clip(sy, margin, self.screen_h - margin)
         return sx, sy
@@ -264,15 +342,13 @@ class Calibrator:
 # ---------------------------------------------------------------------------
 
 def safe_move(x, y):
-    """Move cursor with failsafe protection — never crash, just skip."""
     try:
         pyautogui.moveTo(int(x), int(y), _pause=False)
     except pyautogui.FailSafeException:
-        pass  # Ignorieren, nächster Frame korrigiert die Position
+        pass
 
 
 def safe_click(button='left'):
-    """Click with failsafe protection."""
     try:
         pyautogui.click(button=button)
     except pyautogui.FailSafeException:
@@ -303,7 +379,6 @@ def main():
         min_tracking_confidence=0.5,
     )
 
-    # --- Calibration ---
     calibrator = Calibrator(screen_w, screen_h)
     if not calibrator.load():
         print("Keine Kalibrierung gefunden. Starte Kalibrierung...")
@@ -317,8 +392,8 @@ def main():
         print("Bestehende Kalibrierung geladen. (Taste 'c' zum Neu-Kalibrieren)")
 
     smoother = Smoother()
+    logger = DriftLogger()
 
-    # Blink state
     EAR_THRESHOLD = 0.21
     BLINK_FRAMES = 3
     blink_counter_left = 0
@@ -329,12 +404,13 @@ def main():
     show_preview = True
 
     print("\n--- EyeControl aktiv ---")
-    print("  Linkes Auge blinzeln  -> Linksklick")
-    print("  Rechtes Auge blinzeln -> Rechtsklick")
-    print("  Taste 'c' -> Neu-Kalibrieren")
-    print("  Taste 't' -> Tracking pausieren/fortsetzen")
-    print("  Taste 'p' -> Vorschau ein/aus")
-    print("  Taste 'q' / ESC -> Beenden")
+    print("  Linkes Auge blinzeln  → Linksklick")
+    print("  Rechtes Auge blinzeln → Rechtsklick")
+    print("  Taste 'c' → Neu-Kalibrieren")
+    print("  Taste 't' → Tracking pausieren/fortsetzen")
+    print("  Taste 'l' → Drift-Log starten (10s)")
+    print("  Taste 'p' → Vorschau ein/aus")
+    print("  Taste 'q' / ESC → Beenden")
 
     while True:
         ret, frame = cap.read()
@@ -346,18 +422,22 @@ def main():
         results = face_mesh.process(rgb)
 
         sx, sy = 0, 0
+        raw_ix, raw_iy = 0, 0
+        mapped_sx, mapped_sy = 0, 0
 
         if results.multi_face_landmarks and tracking_active:
             lm = results.multi_face_landmarks[0].landmark
 
-            # --- Gaze ---
-            ix, iy = get_iris_position(lm)
-            sx, sy = calibrator.map(ix, iy)
-            sx, sy = smoother.update(sx, sy)
+            raw_ix, raw_iy = get_iris_position(lm)
+            mapped_sx, mapped_sy = calibrator.map(raw_ix, raw_iy)
+            sx, sy = smoother.update(mapped_sx, mapped_sy)
 
             safe_move(sx, sy)
 
-            # --- Blink detection ---
+            # Drift-Log
+            logger.log(raw_ix, raw_iy, mapped_sx, mapped_sy, sx, sy)
+
+            # Blink detection
             if blink_cooldown > 0:
                 blink_cooldown -= 1
             else:
@@ -380,7 +460,7 @@ def main():
                         blink_cooldown = 15
                     blink_counter_right = 0
 
-        # --- Preview ---
+        # Preview
         if show_preview:
             display = frame.copy()
             if results.multi_face_landmarks:
@@ -391,7 +471,11 @@ def main():
                 cv2.circle(display, (int(ri.x * cam_w), int(ri.y * cam_h)), 4, (0, 255, 0), -1)
 
             status = "AKTIV" if tracking_active else "PAUSIERT"
+            if logger.is_active():
+                status = "LOG..."
             color = (0, 255, 0) if tracking_active else (0, 0, 255)
+            if logger.is_active():
+                color = (0, 165, 255)
             cv2.putText(display, f"[{status}] Cursor: ({int(sx)}, {int(sy)})",
                         (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
             small = cv2.resize(display, (320, 240))
@@ -412,11 +496,18 @@ def main():
             print(f"Tracking {state}")
             if tracking_active:
                 smoother.reset()
+        elif key == ord('l'):
+            if not logger.is_active():
+                logger.start()
+            else:
+                logger.stop()
         elif key == ord('p'):
             show_preview = not show_preview
             if not show_preview:
                 cv2.destroyWindow("EyeControl")
 
+    if logger.is_active():
+        logger.stop()
     cap.release()
     cv2.destroyAllWindows()
     face_mesh.close()
