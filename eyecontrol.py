@@ -70,12 +70,17 @@ def eye_aspect_ratio(landmarks, indices, w, h):
 
 
 class Smoother:
-    """One-euro-inspired smoother: low latency when moving fast, smooth when still."""
+    """
+    Adaptive smoother with deadzone to eliminate stick-drift.
+    Small movements below the deadzone threshold are completely ignored.
+    """
 
-    def __init__(self, alpha_slow=0.04, alpha_fast=0.35, speed_threshold=50.0):
+    def __init__(self, alpha_slow=0.04, alpha_fast=0.35,
+                 speed_threshold=50.0, deadzone=8.0):
         self.alpha_slow = alpha_slow
         self.alpha_fast = alpha_fast
         self.speed_threshold = speed_threshold
+        self.deadzone = deadzone
         self.x = None
         self.y = None
 
@@ -85,6 +90,11 @@ class Smoother:
             return self.x, self.y
 
         speed = ((x - self.x) ** 2 + (y - self.y) ** 2) ** 0.5
+
+        # Deadzone: ignoriere Mikro-Bewegungen (Rauschen / Drift)
+        if speed < self.deadzone:
+            return self.x, self.y
+
         t = min(speed / self.speed_threshold, 1.0)
         alpha = self.alpha_slow + t * (self.alpha_fast - self.alpha_slow)
 
