@@ -1,10 +1,12 @@
 """
 EyeControl - Control your Windows PC with your eyes.
 Uses webcam-based iris tracking to replace the mouse cursor.
+
+Tracking uses iris position in the full camera frame (captures both
+head movement and eye movement) for reliable full-screen coverage.
 """
 
 import json
-import time
 import sys
 from pathlib import Path
 
@@ -19,35 +21,23 @@ except ImportError:
     get_monitors = None
 
 # ---------------------------------------------------------------------------
-# Constants – MediaPipe Face Mesh landmark indices
+# MediaPipe Face Mesh landmark indices
 # ---------------------------------------------------------------------------
-# Iris centre landmarks (with refine_landmarks=True)
 LEFT_IRIS_CENTER = 473
 RIGHT_IRIS_CENTER = 468
 
-# Eye corner landmarks for computing iris ratio
-LEFT_EYE_INNER = 362
-LEFT_EYE_OUTER = 263
-LEFT_EYE_TOP = 386
-LEFT_EYE_BOTTOM = 374
-
-RIGHT_EYE_INNER = 133
-RIGHT_EYE_OUTER = 33
-RIGHT_EYE_TOP = 159
-RIGHT_EYE_BOTTOM = 145
-
-# Eye Aspect Ratio (EAR) landmarks – 6 points per eye
+# EAR landmarks – 6 points per eye
 LEFT_EAR_INDICES = [362, 385, 387, 263, 373, 380]
 RIGHT_EAR_INDICES = [33, 160, 158, 133, 153, 144]
 
 CALIBRATION_FILE = Path("calibration_data.json")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def get_screen_size():
-    """Return (width, height) of the primary monitor."""
     if get_monitors is not None:
         try:
             m = get_monitors()[0]
@@ -57,57 +47,54 @@ def get_screen_size():
     return pyautogui.size()
 
 
+def get_iris_position(landmarks):
+    """
+    Get the average iris center position in normalized frame coordinates (0-1).
+    This captures both head movement and eye movement for maximum range.
+    """
+    left = landmarks[LEFT_IRIS_CENTER]
+    right = landmarks[RIGHT_IRIS_CENTER]
+    x = (left.x + right.x) / 2.0
+    y = (left.y + right.y) / 2.0
+    return x, y
+
+
 def eye_aspect_ratio(landmarks, indices, w, h):
-    """Compute Eye Aspect Ratio for blink detection."""
     pts = [(landmarks[i].x * w, landmarks[i].y * h) for i in indices]
-    # Vertical distances
     v1 = np.linalg.norm(np.array(pts[1]) - np.array(pts[5]))
     v2 = np.linalg.norm(np.array(pts[2]) - np.array(pts[4]))
-    # Horizontal distance
     h_dist = np.linalg.norm(np.array(pts[0]) - np.array(pts[3]))
     if h_dist == 0:
         return 0.3
     return (v1 + v2) / (2.0 * h_dist)
 
 
-def iris_ratio(landmarks, iris_center_idx, inner_idx, outer_idx, top_idx, bottom_idx):
-    """
-    Compute the position of the iris centre relative to the eye corners.
-    Returns (ratio_x, ratio_y) each in [0, 1].
-    """
-    iris = landmarks[iris_center_idx]
-    inner = landmarks[inner_idx]
-    outer = landmarks[outer_idx]
-    top = landmarks[top_idx]
-    bottom = landmarks[bottom_idx]
-
-    eye_w = abs(inner.x - outer.x)
-    eye_h = abs(top.y - bottom.y)
-
-    if eye_w == 0 or eye_h == 0:
-        return 0.5, 0.5
-
-    rx = (iris.x - min(inner.x, outer.x)) / eye_w
-    ry = (iris.y - min(top.y, bottom.y)) / eye_h
-
-    return np.clip(rx, 0, 1), np.clip(ry, 0, 1)
-
-
 class Smoother:
-    """Exponential moving average for cursor smoothing."""
+    """One-euro-inspired smoother: low latency when moving fast, smooth when still."""
 
-    def __init__(self, alpha=0.25):
-        self.alpha = alpha
+    def __init__(self, alpha_slow=0.08, alpha_fast=0.5, speed_threshold=30.0):
+        self.alpha_slow = alpha_slow
+        self.alpha_fast = alpha_fast
+        self.speed_threshold = speed_threshold
         self.x = None
         self.y = None
 
     def update(self, x, y):
         if self.x is None:
             self.x, self.y = x, y
-        else:
-            self.x = self.alpha * x + (1 - self.alpha) * self.x
-            self.y = self.alpha * y + (1 - self.alpha) * self.y
+            return self.x, self.y
+
+        speed = ((x - self.x) ** 2 + (y - self.y) ** 2) ** 0.5
+        t = min(speed / self.speed_threshold, 1.0)
+        alpha = self.alpha_slow + t * (self.alpha_fast - self.alpha_slow)
+
+        self.x = alpha * x + (1 - alpha) * self.x
+        self.y = alpha * y + (1 - alpha) * self.y
         return self.x, self.y
+
+    def reset(self):
+        self.x = None
+        self.y = None
 
 
 # ---------------------------------------------------------------------------
@@ -115,77 +102,80 @@ class Smoother:
 # ---------------------------------------------------------------------------
 
 class Calibrator:
-    """9-point calibration: maps iris ratios to screen coordinates."""
+    """
+    5-point calibration: maps iris frame-coordinates to screen coordinates.
+    Uses the iris position in the full camera frame (not relative to eye corners)
+    for much better range and stability.
+    """
 
     def __init__(self, screen_w, screen_h):
         self.screen_w = screen_w
         self.screen_h = screen_h
-        self.margin = 0.1  # 10 % margin from screen edges
-        self.points = self._grid_points()
-        self.iris_samples = []  # collected (rx, ry) per point
-        self.screen_points = []  # corresponding screen (sx, sy)
-        self.transform_x = None  # polynomial coefficients
+        self.iris_samples = []
+        self.screen_points = []
+        self.transform_x = None
         self.transform_y = None
 
-    def _grid_points(self):
-        """Generate 9 calibration target positions on screen."""
-        mx = self.margin * self.screen_w
-        my = self.margin * self.screen_h
-        cols = [mx, self.screen_w / 2, self.screen_w - mx]
-        rows = [my, self.screen_h / 2, self.screen_h - my]
-        return [(int(c), int(r)) for r in rows for c in cols]
+    def _target_points(self):
+        """5 calibration points: center + 4 corners with margin."""
+        mx = int(self.screen_w * 0.12)
+        my = int(self.screen_h * 0.12)
+        return [
+            (self.screen_w // 2, self.screen_h // 2),  # center first
+            (mx, my),                                    # top-left
+            (self.screen_w - mx, my),                    # top-right
+            (mx, self.screen_h - my),                    # bottom-left
+            (self.screen_w - mx, self.screen_h - my),    # bottom-right
+        ]
 
-    def run(self, face_mesh, cap, cam_w, cam_h):
-        """
-        Run the interactive calibration procedure.
-        Shows dots on a full-screen window; user looks at each dot.
-        """
+    def run(self, face_mesh, cap):
+        """Interactive calibration: show dots, user looks at each, press SPACE."""
         cv2.namedWindow("Calibration", cv2.WND_PROP_FULLSCREEN)
         cv2.setWindowProperty("Calibration", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
+        points = self._target_points()
         self.iris_samples = []
         self.screen_points = []
 
-        for idx, (sx, sy) in enumerate(self.points):
+        for idx, (sx, sy) in enumerate(points):
             # Draw target
             canvas = np.zeros((self.screen_h, self.screen_w, 3), dtype=np.uint8)
-            cv2.circle(canvas, (sx, sy), 25, (0, 255, 0), -1)
-            cv2.circle(canvas, (sx, sy), 5, (255, 255, 255), -1)
-            label = f"Look at the green dot ({idx + 1}/{len(self.points)}) - Press SPACE"
-            cv2.putText(canvas, label, (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            cv2.putText(canvas, "Press ESC to cancel", (30, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 150), 1)
+            cv2.circle(canvas, (sx, sy), 30, (0, 255, 0), -1)
+            cv2.circle(canvas, (sx, sy), 6, (255, 255, 255), -1)
+
+            step_text = f"Schau auf den Punkt ({idx + 1}/{len(points)}) - dann LEERTASTE"
+            cv2.putText(canvas, step_text, (30, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(canvas, "ESC = Abbrechen", (30, 75),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 150, 150), 1)
             cv2.imshow("Calibration", canvas)
 
-            # Wait for SPACE, collect samples
             collected = []
             while True:
                 key = cv2.waitKey(1) & 0xFF
-                if key == 27:  # ESC
+                if key == 27:
                     cv2.destroyWindow("Calibration")
                     return False
+
                 ret, frame = cap.read()
                 if not ret:
                     continue
                 frame = cv2.flip(frame, 1)
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results = face_mesh.process(rgb)
+
                 if results.multi_face_landmarks:
                     lm = results.multi_face_landmarks[0].landmark
-                    lrx, lry = iris_ratio(lm, LEFT_IRIS_CENTER, LEFT_EYE_INNER, LEFT_EYE_OUTER, LEFT_EYE_TOP, LEFT_EYE_BOTTOM)
-                    rrx, rry = iris_ratio(lm, RIGHT_IRIS_CENTER, RIGHT_EYE_INNER, RIGHT_EYE_OUTER, RIGHT_EYE_TOP, RIGHT_EYE_BOTTOM)
-                    avg_rx = (lrx + rrx) / 2
-                    avg_ry = (lry + rry) / 2
-                    collected.append((avg_rx, avg_ry))
+                    ix, iy = get_iris_position(lm)
+                    collected.append((ix, iy))
 
-                if key == 32:  # SPACE
-                    if len(collected) >= 5:
-                        # Average the last 15 samples for stability
-                        recent = collected[-15:]
-                        mean_rx = np.mean([s[0] for s in recent])
-                        mean_ry = np.mean([s[1] for s in recent])
-                        self.iris_samples.append((mean_rx, mean_ry))
-                        self.screen_points.append((sx, sy))
-                        break
+                if key == 32 and len(collected) >= 10:  # SPACE
+                    recent = collected[-20:]
+                    mean_x = np.mean([s[0] for s in recent])
+                    mean_y = np.mean([s[1] for s in recent])
+                    self.iris_samples.append((mean_x, mean_y))
+                    self.screen_points.append((sx, sy))
+                    break
 
         cv2.destroyWindow("Calibration")
         self._fit_transform()
@@ -193,29 +183,39 @@ class Calibrator:
         return True
 
     def _fit_transform(self):
-        """Fit a 2nd-degree polynomial from iris ratios to screen coords."""
+        """Fit affine transform from iris coords to screen coords."""
         iris = np.array(self.iris_samples)
         screen = np.array(self.screen_points)
 
-        # Build feature matrix: [1, rx, ry, rx*ry, rx^2, ry^2]
-        A = np.column_stack([
-            np.ones(len(iris)),
-            iris[:, 0], iris[:, 1],
-            iris[:, 0] * iris[:, 1],
-            iris[:, 0] ** 2, iris[:, 1] ** 2,
-        ])
+        # Feature matrix: [1, x, y, x*y, x^2, y^2] if enough points,
+        # else simpler [1, x, y]
+        if len(iris) >= 5:
+            A = np.column_stack([
+                np.ones(len(iris)),
+                iris[:, 0], iris[:, 1],
+                iris[:, 0] * iris[:, 1],
+                iris[:, 0] ** 2,
+            ])
+        else:
+            A = np.column_stack([
+                np.ones(len(iris)),
+                iris[:, 0], iris[:, 1],
+            ])
 
-        # Least-squares fit
         self.transform_x, _, _, _ = np.linalg.lstsq(A, screen[:, 0], rcond=None)
         self.transform_y, _, _, _ = np.linalg.lstsq(A, screen[:, 1], rcond=None)
 
-    def map(self, rx, ry):
-        """Map iris ratio to screen coordinates using fitted polynomial."""
+    def map(self, ix, iy):
+        """Map iris frame position to screen coordinates."""
         if self.transform_x is None:
-            # Fallback: simple linear mapping
-            return rx * self.screen_w, ry * self.screen_h
+            # Fallback: mirror-map normalized coords to screen
+            return (1.0 - ix) * self.screen_w, iy * self.screen_h
 
-        features = np.array([1, rx, ry, rx * ry, rx ** 2, ry ** 2])
+        if len(self.transform_x) == 5:
+            features = np.array([1, ix, iy, ix * iy, ix ** 2])
+        else:
+            features = np.array([1, ix, iy])
+
         sx = float(features @ self.transform_x)
         sy = float(features @ self.transform_y)
         sx = np.clip(sx, 0, self.screen_w - 1)
@@ -246,27 +246,25 @@ class Calibrator:
 
 
 # ---------------------------------------------------------------------------
-# Main tracking loop
+# Main
 # ---------------------------------------------------------------------------
 
 def main():
-    pyautogui.FAILSAFE = True  # move mouse to corner to abort
-    pyautogui.PAUSE = 0  # no delay between pyautogui calls
+    pyautogui.FAILSAFE = True
+    pyautogui.PAUSE = 0
 
     screen_w, screen_h = get_screen_size()
     print(f"Screen: {screen_w}x{screen_h}")
 
-    # Open webcam
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        print("ERROR: Could not open webcam.")
+        print("FEHLER: Webcam konnte nicht geöffnet werden.")
         sys.exit(1)
 
     cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"Camera: {cam_w}x{cam_h}")
 
-    # MediaPipe Face Mesh
     mp_face_mesh = mp.solutions.face_mesh
     face_mesh = mp_face_mesh.FaceMesh(
         max_num_faces=1,
@@ -275,36 +273,38 @@ def main():
         min_tracking_confidence=0.5,
     )
 
-    # Calibration
+    # --- Calibration ---
     calibrator = Calibrator(screen_w, screen_h)
     if not calibrator.load():
-        print("No calibration found. Starting calibration...")
-        if not calibrator.run(face_mesh, cap, cam_w, cam_h):
-            print("Calibration cancelled.")
+        print("Keine Kalibrierung gefunden. Starte Kalibrierung...")
+        print("Tipp: Bewege nur die Augen, halte den Kopf möglichst still.")
+        if not calibrator.run(face_mesh, cap):
+            print("Kalibrierung abgebrochen.")
             cap.release()
             sys.exit(0)
-        print("Calibration complete!")
+        print("Kalibrierung abgeschlossen!")
     else:
-        print("Loaded existing calibration.")
+        print("Bestehende Kalibrierung geladen. (Taste 'c' zum Neu-Kalibrieren)")
 
-    smoother = Smoother(alpha=0.25)
+    smoother = Smoother()
 
-    # Blink detection state
+    # Blink state
     EAR_THRESHOLD = 0.21
-    BLINK_FRAMES = 3  # minimum consecutive frames below threshold
+    BLINK_FRAMES = 3
     blink_counter_left = 0
     blink_counter_right = 0
-    blink_cooldown = 0  # frames to wait after a click
+    blink_cooldown = 0
 
-    print("\n--- EyeControl active ---")
-    print("Controls:")
-    print("  Left eye blink  -> Left click")
-    print("  Right eye blink -> Right click")
-    print("  Press 'c'       -> Re-calibrate")
-    print("  Press 'q'/ESC   -> Quit")
-    print("  Move mouse to top-left corner -> Emergency stop (PyAutoGUI failsafe)")
-
+    tracking_active = True
     show_preview = True
+
+    print("\n--- EyeControl aktiv ---")
+    print("  Linkes Auge blinzeln  -> Linksklick")
+    print("  Rechtes Auge blinzeln -> Rechtsklick")
+    print("  Taste 'c' -> Neu-Kalibrieren")
+    print("  Taste 't' -> Tracking pausieren/fortsetzen")
+    print("  Taste 'p' -> Vorschau ein/aus")
+    print("  Taste 'q' / ESC -> Beenden")
 
     while True:
         ret, frame = cap.read()
@@ -315,16 +315,14 @@ def main():
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = face_mesh.process(rgb)
 
-        if results.multi_face_landmarks:
+        sx, sy = 0, 0
+
+        if results.multi_face_landmarks and tracking_active:
             lm = results.multi_face_landmarks[0].landmark
 
-            # --- Gaze tracking ---
-            lrx, lry = iris_ratio(lm, LEFT_IRIS_CENTER, LEFT_EYE_INNER, LEFT_EYE_OUTER, LEFT_EYE_TOP, LEFT_EYE_BOTTOM)
-            rrx, rry = iris_ratio(lm, RIGHT_IRIS_CENTER, RIGHT_EYE_INNER, RIGHT_EYE_OUTER, RIGHT_EYE_TOP, RIGHT_EYE_BOTTOM)
-            avg_rx = (lrx + rrx) / 2
-            avg_ry = (lry + rry) / 2
-
-            sx, sy = calibrator.map(avg_rx, avg_ry)
+            # --- Gaze ---
+            ix, iy = get_iris_position(lm)
+            sx, sy = calibrator.map(ix, iy)
             sx, sy = smoother.update(sx, sy)
 
             pyautogui.moveTo(int(sx), int(sy), _pause=False)
@@ -336,7 +334,6 @@ def main():
                 left_ear = eye_aspect_ratio(lm, LEFT_EAR_INDICES, cam_w, cam_h)
                 right_ear = eye_aspect_ratio(lm, RIGHT_EAR_INDICES, cam_w, cam_h)
 
-                # Left eye blink (only left eye closed)
                 if left_ear < EAR_THRESHOLD and right_ear >= EAR_THRESHOLD:
                     blink_counter_left += 1
                 else:
@@ -345,7 +342,6 @@ def main():
                         blink_cooldown = 15
                     blink_counter_left = 0
 
-                # Right eye blink (only right eye closed)
                 if right_ear < EAR_THRESHOLD and left_ear >= EAR_THRESHOLD:
                     blink_counter_right += 1
                 else:
@@ -354,35 +350,47 @@ def main():
                         blink_cooldown = 15
                     blink_counter_right = 0
 
-            # --- Preview window ---
-            if show_preview:
-                # Draw iris positions on preview
+        # --- Preview ---
+        if show_preview:
+            display = frame.copy()
+            if results.multi_face_landmarks:
+                lm = results.multi_face_landmarks[0].landmark
                 li = lm[LEFT_IRIS_CENTER]
                 ri = lm[RIGHT_IRIS_CENTER]
-                cv2.circle(frame, (int(li.x * cam_w), int(li.y * cam_h)), 3, (0, 255, 0), -1)
-                cv2.circle(frame, (int(ri.x * cam_w), int(ri.y * cam_h)), 3, (0, 255, 0), -1)
-                cv2.putText(frame, f"Cursor: ({int(sx)}, {int(sy)})", (10, 25),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
-                small = cv2.resize(frame, (320, 240))
-                cv2.imshow("EyeControl Preview", small)
+                cv2.circle(display, (int(li.x * cam_w), int(li.y * cam_h)), 4, (0, 255, 0), -1)
+                cv2.circle(display, (int(ri.x * cam_w), int(ri.y * cam_h)), 4, (0, 255, 0), -1)
+
+            status = "AKTIV" if tracking_active else "PAUSIERT"
+            color = (0, 255, 0) if tracking_active else (0, 0, 255)
+            cv2.putText(display, f"[{status}] Cursor: ({int(sx)}, {int(sy)})",
+                        (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
+            small = cv2.resize(display, (320, 240))
+            cv2.imshow("EyeControl", small)
 
         key = cv2.waitKey(1) & 0xFF
         if key in (ord('q'), 27):
             break
         elif key == ord('c'):
-            print("Re-calibrating...")
-            calibrator.run(face_mesh, cap, cam_w, cam_h)
-            smoother = Smoother(alpha=0.25)
-            print("Re-calibration complete!")
+            print("Neu-Kalibrierung...")
+            calibrator = Calibrator(screen_w, screen_h)
+            calibrator.run(face_mesh, cap)
+            smoother.reset()
+            print("Kalibrierung abgeschlossen!")
+        elif key == ord('t'):
+            tracking_active = not tracking_active
+            state = "aktiv" if tracking_active else "pausiert"
+            print(f"Tracking {state}")
+            if tracking_active:
+                smoother.reset()
         elif key == ord('p'):
             show_preview = not show_preview
             if not show_preview:
-                cv2.destroyWindow("EyeControl Preview")
+                cv2.destroyWindow("EyeControl")
 
     cap.release()
     cv2.destroyAllWindows()
     face_mesh.close()
-    print("EyeControl stopped.")
+    print("EyeControl beendet.")
 
 
 if __name__ == "__main__":
