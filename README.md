@@ -12,17 +12,137 @@ Control your Windows PC with your eyes — no mouse needed. Uses your webcam to 
 ## Requirements
 
 - Windows 10/11
-- Python 3.9+
 - Standard webcam (built-in or USB)
 - Good lighting (face a light source for best results)
 
-## Installation
+---
+
+## Option A: Installation auf Windows (PowerShell)
+
+### 1. Python installieren
+
+Offne **PowerShell als Administrator** (Rechtsklick auf Start > "Windows PowerShell (Administrator)") und fuehre aus:
+
+```powershell
+# Python 3.12 Installer herunterladen
+Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe" -OutFile "$env:TEMP\python-installer.exe"
+
+# Installer starten (mit PATH-Eintrag und pip)
+Start-Process -Wait -FilePath "$env:TEMP\python-installer.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_pip=1"
+```
+
+**Wichtig:** Schliesse die PowerShell danach und oeffne eine **neue PowerShell**, damit Python im PATH ist.
+
+Pruefe ob es geklappt hat:
+
+```powershell
+python --version
+pip --version
+```
+
+### 2. EyeControl herunterladen und starten
+
+```powershell
+# Projekt herunterladen und entpacken
+Invoke-WebRequest -Uri "https://github.com/Breakdance-Stack/eyecontrol/archive/refs/heads/main.zip" -OutFile "$env:TEMP\eyecontrol.zip"
+Expand-Archive -Path "$env:TEMP\eyecontrol.zip" -DestinationPath "$env:USERPROFILE\eyecontrol" -Force
+
+# In den Ordner wechseln
+cd "$env:USERPROFILE\eyecontrol\eyecontrol-main"
+
+# Abhaengigkeiten installieren
+pip install -r requirements.txt
+
+# Starten
+python eyecontrol.py
+```
+
+---
+
+## Option B: Installation mit WSL2 (Windows Subsystem for Linux)
+
+> **Hinweis:** WSL2 braucht etwas Extra-Setup fuer Webcam- und GUI-Zugriff. Fuer die meisten Nutzer ist **Option A (PowerShell)** einfacher.
+
+### 1. WSL2 aktivieren
+
+Oeffne **PowerShell als Administrator**:
+
+```powershell
+wsl --install -d Ubuntu
+```
+
+Starte den PC neu wenn gefordert. Beim ersten Start von Ubuntu legst du einen Benutzernamen und Passwort an.
+
+### 2. Python und Abhaengigkeiten in WSL2 installieren
+
+Oeffne die **Ubuntu-App** (oder tippe `wsl` in PowerShell):
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/eyecontrol.git
-cd eyecontrol
-pip install -r requirements.txt
+# System aktualisieren
+sudo apt update && sudo apt upgrade -y
+
+# Python und pip installieren
+sudo apt install -y python3 python3-pip python3-venv
+
+# Pruefen
+python3 --version
+pip3 --version
 ```
+
+### 3. EyeControl herunterladen und starten
+
+```bash
+# Projekt herunterladen und entpacken
+curl -L "https://github.com/Breakdance-Stack/eyecontrol/archive/refs/heads/main.tar.gz" -o /tmp/eyecontrol.tar.gz
+mkdir -p ~/eyecontrol && tar -xzf /tmp/eyecontrol.tar.gz -C ~/eyecontrol --strip-components=1
+
+# In den Ordner wechseln
+cd ~/eyecontrol
+
+# Abhaengigkeiten installieren
+pip3 install -r requirements.txt
+
+# Starten
+python3 eyecontrol.py
+```
+
+### 4. WSL2: Webcam und GUI einrichten
+
+Damit EyeControl in WSL2 auf die Webcam und den Bildschirm zugreifen kann:
+
+**GUI-Support (WSLg):** Ab Windows 11 ist WSLg eingebaut — GUI-Fenster funktionieren automatisch. Unter Windows 10 brauchst du einen X-Server wie [VcXsrv](https://sourceforge.net/projects/vcxsrv/):
+
+```bash
+# Nur Windows 10 — X-Server Display setzen
+export DISPLAY=$(cat /etc/resolv.conf | grep nameserver | awk '{print $2}'):0
+```
+
+**Webcam in WSL2:** USB-Webcams muessen via [usbipd-win](https://github.com/dorssel/usbipd-win) an WSL2 durchgereicht werden:
+
+```powershell
+# In PowerShell (als Administrator):
+winget install usbipd
+
+# USB-Geraete auflisten
+usbipd list
+
+# Webcam an WSL2 binden (BUSID durch deine Webcam-ID ersetzen)
+usbipd bind --busid <BUSID>
+usbipd attach --wsl --busid <BUSID>
+```
+
+Dann in WSL2:
+
+```bash
+# Video-Geraet pruefen
+ls /dev/video*
+
+# Noetige Kernel-Module (falls nicht vorhanden)
+sudo apt install -y linux-tools-virtual hwdata
+sudo modprobe uvcvideo
+```
+
+---
 
 ## Usage
 
