@@ -4,7 +4,8 @@ Uses webcam-based iris tracking to replace the mouse cursor.
 
 Tracking uses iris position in the full camera frame (captures both
 head movement and eye movement) for reliable full-screen coverage.
-Drift compensation via slow baseline tracking eliminates cursor wandering.
+Drift compensation via baseline tracking on raw iris coordinates
+(before calibration amplification) eliminates cursor wandering.
 """
 
 import csv
@@ -69,7 +70,7 @@ def eye_aspect_ratio(landmarks, indices, w, h):
 
 
 class MedianFilter:
-    """Sliding-window median filter to remove iris tracking outliers."""
+    """Sliding-window median filter to remove tracking outliers."""
 
     def __init__(self, window=7):
         self.window = window
@@ -88,54 +89,65 @@ class MedianFilter:
 
 class DriftCancelSmoother:
     """
-    Drift-compensating smoother.
+    Drift-compensating smoother with raw-signal saccade detection.
 
-    Maintains a slow-moving 'baseline' that tracks the long-term average
-    of the mapped screen position. Only updates the cursor when the current
-    position deviates significantly from the baseline (= intentional saccade).
-    Slow drift is absorbed by the baseline and never reaches the cursor.
+    Key insight from log analysis: the calibration mapping amplifies
+    raw iris noise ~180,000x. So drift detection must happen on the
+    RAW iris coordinates (before amplification), where noise is only
+    ±0.001 and real saccades are >0.003.
 
-    After a saccade is detected, the cursor smoothly transitions to the
-    new target position.
+    Flow:
+    1. Median-filter raw iris coords (removes spikes)
+    2. Track a slow baseline on raw coords (absorbs drift)
+    3. Only when raw deviation > threshold → saccade → update cursor
+    4. Cursor smoothly transitions to new mapped position
     """
 
-    def __init__(self, saccade_threshold=60.0, baseline_alpha=0.008,
-                 cursor_alpha=0.25):
-        self.saccade_threshold = saccade_threshold
+    def __init__(self, raw_saccade_threshold=0.003, baseline_alpha=0.01,
+                 cursor_alpha=0.2):
+        self.raw_saccade_threshold = raw_saccade_threshold
         self.baseline_alpha = baseline_alpha
         self.cursor_alpha = cursor_alpha
-        self.baseline_x = None
-        self.baseline_y = None
+
+        self.raw_baseline_x = None
+        self.raw_baseline_y = None
         self.target_x = None
         self.target_y = None
         self.cursor_x = None
         self.cursor_y = None
-        self.median = MedianFilter(window=7)
 
-    def update(self, x, y):
-        x, y = self.median.update(x, y)
+        self.raw_median = MedianFilter(window=7)
+        self.mapped_median = MedianFilter(window=5)
+
+    def update(self, raw_ix, raw_iy, mapped_sx, mapped_sy):
+        # Median-Filter auf rohe Iris-Koordinaten (für Saccade-Erkennung)
+        filt_rx, filt_ry = self.raw_median.update(raw_ix, raw_iy)
+        # Median-Filter auf gemappte Koordinaten (für Positionierung)
+        filt_sx, filt_sy = self.mapped_median.update(mapped_sx, mapped_sy)
 
         if self.cursor_x is None:
-            self.baseline_x = self.target_x = self.cursor_x = x
-            self.baseline_y = self.target_y = self.cursor_y = y
-            return x, y
+            self.raw_baseline_x = filt_rx
+            self.raw_baseline_y = filt_ry
+            self.target_x = self.cursor_x = filt_sx
+            self.target_y = self.cursor_y = filt_sy
+            return filt_sx, filt_sy
 
-        # Baseline folgt langsam allem (absorbiert Drift)
-        self.baseline_x += self.baseline_alpha * (x - self.baseline_x)
-        self.baseline_y += self.baseline_alpha * (y - self.baseline_y)
+        # Baseline folgt den rohen Iris-Koordinaten langsam (absorbiert Drift)
+        self.raw_baseline_x += self.baseline_alpha * (filt_rx - self.raw_baseline_x)
+        self.raw_baseline_y += self.baseline_alpha * (filt_ry - self.raw_baseline_y)
 
-        # Abweichung von Baseline = echte Blickbewegung?
-        dev_x = x - self.baseline_x
-        dev_y = y - self.baseline_y
+        # Saccade-Erkennung auf ROHEM Signal (vor Kalibrierungs-Verstärkung)
+        dev_x = filt_rx - self.raw_baseline_x
+        dev_y = filt_ry - self.raw_baseline_y
         dev = (dev_x ** 2 + dev_y ** 2) ** 0.5
 
-        if dev > self.saccade_threshold:
-            # Sakkade erkannt → neues Ziel setzen
-            self.target_x = x
-            self.target_y = y
-            # Baseline auf neue Position resetten
-            self.baseline_x = x
-            self.baseline_y = y
+        if dev > self.raw_saccade_threshold:
+            # Echte Blickbewegung erkannt → Zielposition aktualisieren
+            self.target_x = filt_sx
+            self.target_y = filt_sy
+            # Baseline auf neue Rohposition resetten
+            self.raw_baseline_x = filt_rx
+            self.raw_baseline_y = filt_ry
 
         # Cursor gleitet sanft zum Ziel
         self.cursor_x += self.cursor_alpha * (self.target_x - self.cursor_x)
@@ -143,13 +155,14 @@ class DriftCancelSmoother:
         return self.cursor_x, self.cursor_y
 
     def reset(self):
-        self.baseline_x = None
-        self.baseline_y = None
+        self.raw_baseline_x = None
+        self.raw_baseline_y = None
         self.target_x = None
         self.target_y = None
         self.cursor_x = None
         self.cursor_y = None
-        self.median.reset()
+        self.raw_median.reset()
+        self.mapped_median.reset()
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +465,7 @@ def main():
 
             raw_ix, raw_iy = get_iris_position(lm)
             mapped_sx, mapped_sy = calibrator.map(raw_ix, raw_iy)
-            sx, sy = smoother.update(mapped_sx, mapped_sy)
+            sx, sy = smoother.update(raw_ix, raw_iy, mapped_sx, mapped_sy)
 
             safe_move(sx, sy)
 
