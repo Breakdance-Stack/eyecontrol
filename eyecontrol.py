@@ -72,7 +72,7 @@ def eye_aspect_ratio(landmarks, indices, w, h):
 class Smoother:
     """One-euro-inspired smoother: low latency when moving fast, smooth when still."""
 
-    def __init__(self, alpha_slow=0.08, alpha_fast=0.5, speed_threshold=30.0):
+    def __init__(self, alpha_slow=0.04, alpha_fast=0.35, speed_threshold=50.0):
         self.alpha_slow = alpha_slow
         self.alpha_fast = alpha_fast
         self.speed_threshold = speed_threshold
@@ -208,8 +208,10 @@ class Calibrator:
     def map(self, ix, iy):
         """Map iris frame position to screen coordinates."""
         if self.transform_x is None:
-            # Fallback: mirror-map normalized coords to screen
-            return (1.0 - ix) * self.screen_w, iy * self.screen_h
+            margin = 5
+            sx = np.clip((1.0 - ix) * self.screen_w, margin, self.screen_w - margin)
+            sy = np.clip(iy * self.screen_h, margin, self.screen_h - margin)
+            return sx, sy
 
         if len(self.transform_x) == 5:
             features = np.array([1, ix, iy, ix * iy, ix ** 2])
@@ -218,8 +220,10 @@ class Calibrator:
 
         sx = float(features @ self.transform_x)
         sy = float(features @ self.transform_y)
-        sx = np.clip(sx, 0, self.screen_w - 1)
-        sy = np.clip(sy, 0, self.screen_h - 1)
+        # Sicherheitsrand: nie in die Ecken (verhindert PyAutoGUI Failsafe)
+        margin = 5
+        sx = np.clip(sx, margin, self.screen_w - margin)
+        sy = np.clip(sy, margin, self.screen_h - margin)
         return sx, sy
 
     def _save(self):
@@ -248,6 +252,22 @@ class Calibrator:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+def safe_move(x, y):
+    """Move cursor with failsafe protection — never crash, just skip."""
+    try:
+        pyautogui.moveTo(int(x), int(y), _pause=False)
+    except pyautogui.FailSafeException:
+        pass  # Ignorieren, nächster Frame korrigiert die Position
+
+
+def safe_click(button='left'):
+    """Click with failsafe protection."""
+    try:
+        pyautogui.click(button=button)
+    except pyautogui.FailSafeException:
+        pass
+
 
 def main():
     pyautogui.FAILSAFE = True
@@ -325,7 +345,7 @@ def main():
             sx, sy = calibrator.map(ix, iy)
             sx, sy = smoother.update(sx, sy)
 
-            pyautogui.moveTo(int(sx), int(sy), _pause=False)
+            safe_move(sx, sy)
 
             # --- Blink detection ---
             if blink_cooldown > 0:
@@ -338,7 +358,7 @@ def main():
                     blink_counter_left += 1
                 else:
                     if blink_counter_left >= BLINK_FRAMES:
-                        pyautogui.click(button='left')
+                        safe_click('left')
                         blink_cooldown = 15
                     blink_counter_left = 0
 
@@ -346,7 +366,7 @@ def main():
                     blink_counter_right += 1
                 else:
                     if blink_counter_right >= BLINK_FRAMES:
-                        pyautogui.click(button='right')
+                        safe_click('right')
                         blink_cooldown = 15
                     blink_counter_right = 0
 
