@@ -4,6 +4,7 @@ Uses webcam-based iris tracking to replace the mouse cursor.
 
 Tracking uses iris position in the full camera frame (captures both
 head movement and eye movement) for reliable full-screen coverage.
+Drift compensation via slow baseline tracking eliminates cursor wandering.
 """
 
 import csv
@@ -70,7 +71,7 @@ def eye_aspect_ratio(landmarks, indices, w, h):
 class MedianFilter:
     """Sliding-window median filter to remove iris tracking outliers."""
 
-    def __init__(self, window=5):
+    def __init__(self, window=7):
         self.window = window
         self.buf_x = deque(maxlen=window)
         self.buf_y = deque(maxlen=window)
@@ -85,48 +86,69 @@ class MedianFilter:
         self.buf_y.clear()
 
 
-class Smoother:
+class DriftCancelSmoother:
     """
-    Adaptive smoother with deadzone to eliminate drift.
-    - Median pre-filter removes outlier spikes
-    - Deadzone ignores micro-movements
-    - Adaptive alpha: slow when still, fast when moving
+    Drift-compensating smoother.
+
+    Maintains a slow-moving 'baseline' that tracks the long-term average
+    of the mapped screen position. Only updates the cursor when the current
+    position deviates significantly from the baseline (= intentional saccade).
+    Slow drift is absorbed by the baseline and never reaches the cursor.
+
+    After a saccade is detected, the cursor smoothly transitions to the
+    new target position.
     """
 
-    def __init__(self, alpha_slow=0.03, alpha_fast=0.3,
-                 speed_threshold=40.0, deadzone=15.0):
-        self.alpha_slow = alpha_slow
-        self.alpha_fast = alpha_fast
-        self.speed_threshold = speed_threshold
-        self.deadzone = deadzone
-        self.x = None
-        self.y = None
-        self.median = MedianFilter(window=5)
+    def __init__(self, saccade_threshold=60.0, baseline_alpha=0.008,
+                 cursor_alpha=0.25):
+        self.saccade_threshold = saccade_threshold
+        self.baseline_alpha = baseline_alpha
+        self.cursor_alpha = cursor_alpha
+        self.baseline_x = None
+        self.baseline_y = None
+        self.target_x = None
+        self.target_y = None
+        self.cursor_x = None
+        self.cursor_y = None
+        self.median = MedianFilter(window=7)
 
     def update(self, x, y):
-        # Median-Filter zuerst: entfernt Ausreißer
         x, y = self.median.update(x, y)
 
-        if self.x is None:
-            self.x, self.y = x, y
-            return self.x, self.y
+        if self.cursor_x is None:
+            self.baseline_x = self.target_x = self.cursor_x = x
+            self.baseline_y = self.target_y = self.cursor_y = y
+            return x, y
 
-        speed = ((x - self.x) ** 2 + (y - self.y) ** 2) ** 0.5
+        # Baseline folgt langsam allem (absorbiert Drift)
+        self.baseline_x += self.baseline_alpha * (x - self.baseline_x)
+        self.baseline_y += self.baseline_alpha * (y - self.baseline_y)
 
-        # Deadzone: ignoriere kleine Bewegungen komplett
-        if speed < self.deadzone:
-            return self.x, self.y
+        # Abweichung von Baseline = echte Blickbewegung?
+        dev_x = x - self.baseline_x
+        dev_y = y - self.baseline_y
+        dev = (dev_x ** 2 + dev_y ** 2) ** 0.5
 
-        t = min(speed / self.speed_threshold, 1.0)
-        alpha = self.alpha_slow + t * (self.alpha_fast - self.alpha_slow)
+        if dev > self.saccade_threshold:
+            # Sakkade erkannt → neues Ziel setzen
+            self.target_x = x
+            self.target_y = y
+            # Baseline auf neue Position resetten
+            self.baseline_x = x
+            self.baseline_y = y
 
-        self.x = alpha * x + (1 - alpha) * self.x
-        self.y = alpha * y + (1 - alpha) * self.y
-        return self.x, self.y
+        # Cursor gleitet sanft zum Ziel
+        self.cursor_x += self.cursor_alpha * (self.target_x - self.cursor_x)
+        self.cursor_y += self.cursor_alpha * (self.target_y - self.cursor_y)
+        return self.cursor_x, self.cursor_y
 
     def reset(self):
-        self.x = None
-        self.y = None
+        self.baseline_x = None
+        self.baseline_y = None
+        self.target_x = None
+        self.target_y = None
+        self.cursor_x = None
+        self.cursor_y = None
         self.median.reset()
 
 
@@ -144,7 +166,7 @@ class DriftLogger:
         self.path = path
         self.active = False
         self.start_time = 0
-        self.duration = 10.0  # Sekunden
+        self.duration = 10.0
         self.writer = None
         self.file = None
 
@@ -391,7 +413,7 @@ def main():
     else:
         print("Bestehende Kalibrierung geladen. (Taste 'c' zum Neu-Kalibrieren)")
 
-    smoother = Smoother()
+    smoother = DriftCancelSmoother()
     logger = DriftLogger()
 
     EAR_THRESHOLD = 0.21
@@ -434,7 +456,6 @@ def main():
 
             safe_move(sx, sy)
 
-            # Drift-Log
             logger.log(raw_ix, raw_iy, mapped_sx, mapped_sy, sx, sy)
 
             # Blink detection
